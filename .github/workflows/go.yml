@@ -44,7 +44,7 @@ jobs:
         go-version-file: 'kms/go.mod'
     - name: Test
       run: | 
-        go test ./kms ./kes
+        go test ./kms/... ./kes/...
   
   vulncheck:
     name: Vulncheck

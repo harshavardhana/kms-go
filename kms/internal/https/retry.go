@@ -259,6 +259,8 @@ func (lb *LoadBalancer) suspendedHosts() []string {
 	return hosts
 }
 
+// timeout returns how long a host stays suspended when no Probe decides
+// about it, defaulting to 30 seconds.
 func timeout(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 30 * time.Second
@@ -266,6 +268,8 @@ func timeout(d time.Duration) time.Duration {
 	return d
 }
 
+// probeInterval returns the delay between two probe rounds, defaulting
+// to 5 seconds.
 func probeInterval(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 5 * time.Second
@@ -273,6 +277,9 @@ func probeInterval(d time.Duration) time.Duration {
 	return d
 }
 
+// isRetryable reports whether a request that failed with err should be
+// retried with a different host, and therefore whether the host it was
+// sent to should be suspended.
 func isRetryable(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
@@ -288,6 +295,8 @@ func isRetryable(ctx context.Context, err error) bool {
 	return !errors.Is(err, context.Canceled)
 }
 
+// closeResponseBody drains and closes the body of a response that is
+// being discarded, so that its connection can be reused.
 func closeResponseBody(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return

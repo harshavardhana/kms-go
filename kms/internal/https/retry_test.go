@@ -20,8 +20,10 @@ var errDown = errors.New("host is down")
 // was asked for.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+// RoundTrip calls f.
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
+// Host must not return a suspended host while other hosts are available.
 func TestLoadBalancerHostSkipsSuspendedHost(t *testing.T) {
 	lb := &LoadBalancer{
 		Hosts:         []string{"a", "b", "c"},
@@ -41,6 +43,8 @@ func TestLoadBalancerHostSkipsSuspendedHost(t *testing.T) {
 	}
 }
 
+// Host must still return a host once every host is suspended, so that a
+// client keeps making progress during a full outage.
 func TestLoadBalancerHostWithAllHostsSuspended(t *testing.T) {
 	lb := &LoadBalancer{
 		Hosts:         []string{"a", "b", "c"},
@@ -60,6 +64,10 @@ func TestLoadBalancerHostWithAllHostsSuspended(t *testing.T) {
 	}
 }
 
+// A host that does not respond must stay suspended even after Timeout
+// elapsed. This is the behavior probing exists for: re-admitting an
+// unreachable host on a timer makes every client pay its dial timeout
+// again.
 func TestLoadBalancerProbeKeepsUnresponsiveHostSuspended(t *testing.T) {
 	lb := &LoadBalancer{
 		Hosts:         []string{"a", "b"},
@@ -80,6 +88,9 @@ func TestLoadBalancerProbeKeepsUnresponsiveHostSuspended(t *testing.T) {
 	}
 }
 
+// A suspended host must be re-admitted once, and only once, a probe of it
+// succeeds. Probing must then stop, so that it does not outlive the
+// outage.
 func TestLoadBalancerProbeReadmitsHostOnlyOnceItResponds(t *testing.T) {
 	live := make(chan struct{})
 	probed := make(chan string, 1024)
@@ -124,6 +135,8 @@ func TestLoadBalancerProbeReadmitsHostOnlyOnceItResponds(t *testing.T) {
 	})
 }
 
+// Without a Probe, Timeout keeps its previous meaning and re-admits a
+// suspended host once it elapsed.
 func TestLoadBalancerTimeoutReadmitsHostWithoutProbe(t *testing.T) {
 	lb := &LoadBalancer{
 		Hosts:   []string{"a", "b"},
@@ -145,6 +158,8 @@ func TestLoadBalancerTimeoutReadmitsHostWithoutProbe(t *testing.T) {
 	})
 }
 
+// RoundTrip must retry a failed request with another host, suspend the
+// host it failed for, and start probing that host.
 func TestLoadBalancerRoundTripSuspendsFailedHost(t *testing.T) {
 	probed := make(chan string, 1024)
 
@@ -188,6 +203,8 @@ func (lb *LoadBalancer) suspended(host string) bool {
 	return ok
 }
 
+// waitFor polls cond until it holds, and fails the test if it does not
+// within a fixed timeout.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
@@ -229,6 +246,8 @@ func TestLoadBalancerRoundTripSuspendsHostOnTimeoutWithLiveContext(t *testing.T)
 	}
 }
 
+// An expired request context means the caller is gone, not that the host
+// is unhealthy. RoundTrip must neither suspend the host nor retry.
 func TestLoadBalancerRoundTripKeepsHostOnCallerTimeout(t *testing.T) {
 	hosts := make(chan string, 1024)
 	lb := &LoadBalancer{

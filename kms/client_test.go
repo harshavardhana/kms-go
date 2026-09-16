@@ -16,6 +16,7 @@ type recordingRoundTripper struct {
 	paths chan string
 }
 
+// RoundTrip records the path it was asked for and replies with 200 OK.
 func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.paths <- req.URL.Path
 	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil

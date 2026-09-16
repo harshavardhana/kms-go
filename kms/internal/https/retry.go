@@ -140,7 +140,7 @@ func (lb *LoadBalancer) Host() (string, error) {
 // for subsequent requests or retries.
 func (lb *LoadBalancer) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := lb.RoundTripper.RoundTrip(req)
-	if err != nil && isRetryable(err) {
+	if err != nil && isRetryable(req.Context(), err) {
 		r := slices.Index(lb.Hosts, req.URL.Host)
 		if r < 0 {
 			return resp, err
@@ -162,7 +162,7 @@ func (lb *LoadBalancer) RoundTrip(req *http.Request) (*http.Response, error) {
 
 			req.URL.Host = lb.Hosts[r]
 			resp, err = lb.RoundTripper.RoundTrip(req)
-			if err == nil || !isRetryable(err) {
+			if err == nil || !isRetryable(req.Context(), err) {
 				return resp, err
 			}
 			lb.suspend(req.URL.Host)
@@ -273,15 +273,19 @@ func probeInterval(d time.Duration) time.Duration {
 	return d
 }
 
-func isRetryable(err error) bool {
+func isRetryable(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) {
+
+	// A dial or I/O timeout also matches context.DeadlineExceeded since
+	// net.Dialer implements its Timeout with a context deadline. Only an
+	// expired request context tells the two apart: the caller is gone, so
+	// no retry can succeed and the host is not at fault.
+	if ctx.Err() != nil {
 		return false
 	}
-
-	return true
+	return !errors.Is(err, context.Canceled)
 }
 
 func closeResponseBody(resp *http.Response) {

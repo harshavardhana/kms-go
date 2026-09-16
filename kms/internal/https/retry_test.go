@@ -200,3 +200,58 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out after %v waiting for %s", Timeout, what)
 }
+
+// A dial timeout matches context.DeadlineExceeded because net.Dialer
+// implements its Timeout with a context deadline. It is the error an
+// unreachable host produces, so it must suspend that host.
+func TestLoadBalancerRoundTripSuspendsHostOnTimeoutWithLiveContext(t *testing.T) {
+	lb := &LoadBalancer{
+		Hosts: []string{"a", "b"},
+		RoundTripper: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "a" {
+				return nil, context.DeadlineExceeded
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		}),
+		Probe:         func(context.Context, string) error { return errDown },
+		ProbeInterval: time.Hour,
+	}
+
+	resp, err := lb.RoundTrip(&http.Request{URL: &url.URL{Scheme: "https", Host: "a"}})
+	if err != nil {
+		t.Fatalf("RoundTrip did not retry the request with a different host: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if !lb.suspended("a") {
+		t.Fatal("RoundTrip did not suspend the host that timed out")
+	}
+}
+
+func TestLoadBalancerRoundTripKeepsHostOnCallerTimeout(t *testing.T) {
+	hosts := make(chan string, 1024)
+	lb := &LoadBalancer{
+		Hosts: []string{"a", "b"},
+		RoundTripper: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			hosts <- req.URL.Host
+			return nil, context.DeadlineExceeded
+		}),
+		Probe:         func(context.Context, string) error { return errDown },
+		ProbeInterval: time.Hour,
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	req := (&http.Request{URL: &url.URL{Scheme: "https", Host: "a"}}).WithContext(ctx)
+	if _, err := lb.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip did not return the caller's error")
+	}
+	if lb.suspended("a") {
+		t.Fatal("RoundTrip suspended a host because the caller's context expired")
+	}
+	if len(hosts) != 1 {
+		t.Fatalf("RoundTrip sent %d requests, want 1 - it must not retry for a caller that is gone", len(hosts))
+	}
+}

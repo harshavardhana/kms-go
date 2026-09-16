@@ -27,8 +27,11 @@ import (
 // If a request to one of these hosts fails, the LoadBalancer retries
 // the request with different hosts until either the request succeeds
 // or there are no hosts remaining resp. the retry limit is reached.
-// Hosts for which requests fail are temporarily excluded and no longer
-// selected for subsequent requests.
+// Hosts for which requests fail are suspended and no longer selected
+// for subsequent requests.
+//
+// A suspended host is re-admitted once a Probe of that host succeeds.
+// Without a Probe, it is re-admitted after Timeout elapsed.
 type LoadBalancer struct {
 	// Underlying RoundTripper used to send requests.
 	http.RoundTripper
@@ -40,10 +43,33 @@ type LoadBalancer struct {
 	// request.
 	Hosts []string
 
-	// Timeout controls how long a host is excluded if a
+	// Timeout controls how long a host is suspended if a
 	// request to this host fails. If 0, defaults to 30
 	// seconds.
+	//
+	// It is only used if Probe is nil.
 	Timeout time.Duration
+
+	// Probe reports whether a host is able to serve requests.
+	// It should return a nil error if, and only if, the host
+	// responded.
+	//
+	// If Probe is not nil, a suspended host is only re-admitted
+	// once a Probe of that host succeeds. An unreachable host
+	// therefore stays suspended instead of being re-admitted on
+	// a timer while it is still unreachable.
+	//
+	// Probe must not send its requests through the LoadBalancer
+	// itself since the LoadBalancer does not select suspended
+	// hosts.
+	Probe func(ctx context.Context, host string) error
+
+	// ProbeInterval is the delay between two rounds of probing
+	// the suspended hosts. If 0, defaults to 5 seconds. A probe
+	// is canceled once ProbeInterval elapsed.
+	//
+	// It is only used if Probe is not nil.
+	ProbeInterval time.Duration
 
 	// Retry specifies how often the LoadBalancer retries
 	// a request with different hosts bef
@@ -51,6 +77,7 @@ type LoadBalancer struct {
 
 	mu      sync.RWMutex
 	timeout map[string]time.Time
+	probing bool
 }
 
 // URL returns an URL string with the next host and the provided
@@ -85,14 +112,14 @@ func (lb *LoadBalancer) Host() (string, error) {
 	case 1:
 		return lb.Hosts[0], nil
 	default:
-		t, r := timeout(lb.Timeout), rand.Intn(len(lb.Hosts))
+		r := rand.Intn(len(lb.Hosts))
 
 		lb.mu.RLock()
 		defer lb.mu.RUnlock()
 
 		now := time.Now()
 		for i := 0; i < len(lb.Hosts); i++ {
-			if timeout, ok := lb.timeout[lb.Hosts[r]]; !ok || now.Sub(timeout) > t {
+			if !lb.isSuspended(lb.Hosts[r], now) {
 				return lb.Hosts[r], nil
 			}
 			r = (r + 1) % len(lb.Hosts)
@@ -109,8 +136,8 @@ func (lb *LoadBalancer) Host() (string, error) {
 // succeeded before. It stops retrying once the request succeeds,
 // there are no more non-suspended hosts remaining or the retry limit
 // is reached.
-// Hosts, for which requests fail, are temporarily excluded and no longer
-// selected for subsequent requests or retries.
+// Hosts, for which requests fail, are suspended and no longer selected
+// for subsequent requests or retries.
 func (lb *LoadBalancer) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := lb.RoundTripper.RoundTrip(req)
 	if err != nil && isRetryable(err) {
@@ -118,24 +145,17 @@ func (lb *LoadBalancer) RoundTrip(req *http.Request) (*http.Response, error) {
 		if r < 0 {
 			return resp, err
 		}
+		lb.suspend(req.URL.Host)
 
 		now := time.Now()
-		lb.mu.Lock()
-		if lb.timeout == nil {
-			lb.timeout = map[string]time.Time{}
-		}
-		lb.timeout[req.URL.Host] = now
-		lb.mu.Unlock()
-
-		t := timeout(lb.Timeout)
 		for i := 1; i < len(lb.Hosts); i++ {
 			r = (r + 1) % len(lb.Hosts)
 
 			lb.mu.RLock()
-			timeout, ok := lb.timeout[lb.Hosts[r]]
+			suspended := lb.isSuspended(lb.Hosts[r], now)
 			lb.mu.RUnlock()
 
-			if ok && now.Sub(timeout) < t {
+			if suspended {
 				continue
 			}
 			closeResponseBody(resp)
@@ -145,18 +165,110 @@ func (lb *LoadBalancer) RoundTrip(req *http.Request) (*http.Response, error) {
 			if err == nil || !isRetryable(err) {
 				return resp, err
 			}
-
-			lb.mu.Lock()
-			lb.timeout[req.URL.Host] = time.Now()
-			lb.mu.Unlock()
+			lb.suspend(req.URL.Host)
 		}
 	}
 	return resp, err
 }
 
+// suspend excludes host from host selection. It starts probing the
+// suspended hosts if lb re-admits hosts based on Probe and no probing
+// is in progress.
+func (lb *LoadBalancer) suspend(host string) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	if lb.timeout == nil {
+		lb.timeout = map[string]time.Time{}
+	}
+	lb.timeout[host] = time.Now()
+
+	if lb.Probe != nil && !lb.probing {
+		lb.probing = true
+		go lb.probeHosts()
+	}
+}
+
+// resume re-admits host to host selection.
+func (lb *LoadBalancer) resume(host string) {
+	lb.mu.Lock()
+	delete(lb.timeout, host)
+	lb.mu.Unlock()
+}
+
+// isSuspended reports whether host is currently excluded from host
+// selection. Callers must hold lb.mu.
+func (lb *LoadBalancer) isSuspended(host string, now time.Time) bool {
+	t, ok := lb.timeout[host]
+	if !ok {
+		return false
+	}
+	if lb.Probe != nil {
+		return true
+	}
+	return now.Sub(t) <= timeout(lb.Timeout)
+}
+
+// probeHosts probes all suspended hosts, once per ProbeInterval, and
+// re-admits those that respond. It returns once no host is suspended
+// anymore. A new probeHosts is started by the next suspend.
+func (lb *LoadBalancer) probeHosts() {
+	interval := probeInterval(lb.ProbeInterval)
+	for {
+		hosts := lb.suspendedHosts()
+		if len(hosts) == 0 {
+			return
+		}
+
+		var wg sync.WaitGroup
+		for _, host := range hosts {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				ctx, cancel := context.WithTimeout(context.Background(), interval)
+				defer cancel()
+
+				if lb.Probe(ctx, host) == nil {
+					lb.resume(host)
+				}
+			}()
+		}
+		wg.Wait()
+
+		time.Sleep(interval)
+	}
+}
+
+// suspendedHosts returns the currently suspended hosts. It stops
+// probing if no host is suspended, such that the emptiness check
+// and the hand-off to the next suspend happen atomically.
+func (lb *LoadBalancer) suspendedHosts() []string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	if len(lb.timeout) == 0 {
+		lb.probing = false
+		return nil
+	}
+
+	hosts := make([]string, 0, len(lb.timeout))
+	for host := range lb.timeout {
+		hosts = append(hosts, host)
+	}
+	return hosts
+}
+
 func timeout(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 30 * time.Second
+	}
+	return d
+}
+
+func probeInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 5 * time.Second
 	}
 	return d
 }
